@@ -1,0 +1,6 @@
+name: solar_calculator
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - matplotlib
