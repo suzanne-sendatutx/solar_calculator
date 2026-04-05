@@ -14,6 +14,7 @@ import sys
 DEFAULT_NEM12_FILE = "QB04868277_20250326_20260326_20260327083826_ENERGEXP_DETAILED.csv"
 
 DEFAULT_ENERGY_RATE = 0.3524
+DEFAULT_CONTROLLED_LOAD_RATE = 0.3524
 DEFAULT_DAILY_SUPPLY_CHARGE = 1.4287
 DEFAULT_FEED_IN_TARIFF = 0.03
 DEFAULT_ENERGY_INFLATION = 0.03
@@ -38,6 +39,8 @@ def parse_args(argv=None):
                    help="Path to NEM12 CSV file")
     p.add_argument("--energy-rate", type=float, default=DEFAULT_ENERGY_RATE,
                    help="Energy import rate ($/kWh)")
+    p.add_argument("--controlled-load-rate", type=float, default=DEFAULT_CONTROLLED_LOAD_RATE,
+                   help="Controlled load import rate ($/kWh) for E2")
     p.add_argument("--daily-supply-charge", type=float, default=DEFAULT_DAILY_SUPPLY_CHARGE,
                    help="Daily supply charge ($/day)")
     p.add_argument("--feed-in-tariff", type=float, default=DEFAULT_FEED_IN_TARIFF,
@@ -119,7 +122,8 @@ def calc_no_battery(data, dates, cfg, growth_factor=1.0, rate_factor=1.0):
     Inflation is applied to import and supply charges only.
     Feed-in tariff remains fixed in nominal terms.
     """
-    total_import_kwh = 0.0
+    total_e1_import_kwh = 0.0
+    total_e2_import_kwh = 0.0
     total_export_kwh = 0.0
 
     for date in dates:
@@ -128,16 +132,20 @@ def calc_no_battery(data, dates, cfg, growth_factor=1.0, rate_factor=1.0):
         e2 = data[date].get("E2", ZERO_288)
 
         for i in range(288):
-            total_import_kwh += (e1[i] + e2[i]) * growth_factor
+            total_e1_import_kwh += e1[i] * growth_factor
+            total_e2_import_kwh += e2[i] * growth_factor
             total_export_kwh += b1[i]
 
     num_days = len(dates)
     inflated_import_and_supply = (
-        total_import_kwh * cfg.energy_rate
+        total_e1_import_kwh * cfg.energy_rate
+        + total_e2_import_kwh * cfg.controlled_load_rate
         + num_days * cfg.daily_supply_charge
     ) * rate_factor
     fixed_feed_in_credit = total_export_kwh * cfg.feed_in_tariff
     cost = inflated_import_and_supply - fixed_feed_in_credit
+
+    total_import_kwh = total_e1_import_kwh + total_e2_import_kwh
 
     return total_import_kwh, total_export_kwh, cost
 
@@ -217,6 +225,45 @@ def calc_with_battery(data, dates, cfg, growth_factor=1.0, rate_factor=1.0,
     )
 
 
+def calc_no_solar(data, dates, cfg, growth_factor=1.0, rate_factor=1.0):
+    """Calculate annual cost with NO solar input (grid-only baseline).
+
+    All consumption (E1 + E2) must come from grid.
+    We estimate additional missing grid import from on-site solar as B1,
+    i.e. if solar did not exist, that energy would also be imported.
+    No export, no solar generation.
+    Inflation is applied to import and supply charges only.
+    """
+    total_e1_import_kwh = 0.0
+    total_e2_import_kwh = 0.0
+    estimated_missing_import_kwh = 0.0
+
+    for date in dates:
+        b1 = data[date].get("B1", ZERO_288)
+        e1 = data[date].get("E1", ZERO_288)
+        e2 = data[date].get("E2", ZERO_288)
+
+        for i in range(288):
+            estimated_missing_import_kwh += b1[i]
+            total_e1_import_kwh += e1[i] * growth_factor
+            total_e2_import_kwh += e2[i] * growth_factor
+
+    num_days = len(dates)
+    total_import_kwh = (
+        total_e1_import_kwh
+        + total_e2_import_kwh
+        + estimated_missing_import_kwh
+    )
+    inflated_import_and_supply = (
+        (total_e1_import_kwh + estimated_missing_import_kwh) * cfg.energy_rate
+        + total_e2_import_kwh * cfg.controlled_load_rate
+        + num_days * cfg.daily_supply_charge
+    ) * rate_factor
+    cost = inflated_import_and_supply
+
+    return total_import_kwh, estimated_missing_import_kwh, cost
+
+
 def annual_savings_series(data, dates, cfg, years):
     """Return annual bill savings series (no battery cost - with battery cost)."""
     savings = []
@@ -265,6 +312,7 @@ def main():
     # ── Configuration summary ─────────────────────────────────────────────
     print(f"\nConfiguration:")
     print(f"  Energy rate:       ${cfg.energy_rate:.4f}/kWh")
+    print(f"  Controlled load:   ${cfg.controlled_load_rate:.4f}/kWh")
     print(f"  Daily supply:      ${cfg.daily_supply_charge:.4f}/day")
     print(f"  Feed-in tariff:    ${cfg.feed_in_tariff:.2f}/kWh")
     print(f"  Energy inflation:  {cfg.energy_inflation * 100:.1f}%/yr")
@@ -275,28 +323,38 @@ def main():
     print(f"  Battery cost:      ${cfg.battery_cost:,.0f}")
 
     # ── Year 1 results ────────────────────────────────────────────────────
+    ns_import, ns_extra_import, ns_cost = calc_no_solar(data, dates, cfg)
     nb_import, nb_export, nb_cost = calc_no_battery(data, dates, cfg)
     bt_import, bt_export, bt_cost, bt_grid_import_days = calc_with_battery(
         data, dates, cfg
     )
-    year1_savings = nb_cost - bt_cost
+    year1_savings_vs_solar = nb_cost - bt_cost
+    solar_savings = ns_cost - nb_cost
+    battery_savings = ns_cost - bt_cost
 
     print(f"\n{'─' * 60}")
     print(f"Year 1 (current rates)")
     print(f"{'─' * 60}")
 
-    print(f"\n  Without battery (current setup):")
+    print(f"\n  Baseline (no solar, grid-only):")
+    print(f"    Grid import:  {ns_import:>10,.1f} kWh")
+    print(f"    Extra import if no solar (est): {ns_extra_import:>10,.1f} kWh")
+    print(f"    Annual cost:  {ns_cost:>10,.2f}")
+
+    print(f"\n  Without battery (current setup with solar):")
     print(f"    Grid import:  {nb_import:>10,.1f} kWh")
     print(f"    Solar export: {nb_export:>10,.1f} kWh")
     print(f"    Annual cost:  {nb_cost:>10,.2f}")
+    print(f"    Savings vs baseline: ${solar_savings:>10,.2f}")
 
     print(f"\n  With battery:")
     print(f"    Grid import:  {bt_import:>10,.1f} kWh")
     print(f"    Solar export: {bt_export:>10,.1f} kWh")
     print(f"    Annual cost:  {bt_cost:>10,.2f}")
     print(f"    Days with any grid import:          {bt_grid_import_days:>5}")
+    print(f"    Savings vs baseline: ${battery_savings:>10,.2f}")
 
-    print(f"\n  Annual savings: ${year1_savings:,.2f}")
+    print(f"\n  Battery additional savings: ${year1_savings_vs_solar:,.2f}")
 
     # ── Multi-year payback analysis ───────────────────────────────────────
     print(f"\n{'─' * 60}")
